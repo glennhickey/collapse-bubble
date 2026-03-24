@@ -242,6 +242,20 @@ def concat_variants(var_lst: list[pysam.VariantRecord],
         # find variants with alt
         var_idx = np.where(alt_mat[:, hap_idx])[0]
 
+        # check if alleles can be concatenated before consuming genotypes
+        concat_var_lst = [var_lst[i] for i in var_idx]
+        concat_result = concat_alleles(concat_var_lst)
+        if concat_result is None:
+            # concatenation failed — skip this haplotype, preserve original genotypes
+            alt_sum_arr[hap_idx] = 0
+            continue
+
+        # validate concatenated REF against ALL variants at this position
+        concat_ref = concat_result[0]
+        if not all(is_ref_compatible(concat_ref, v.ref) for v in var_lst):
+            alt_sum_arr[hap_idx] = 0
+            continue
+
         # concat genotypes
         new_gt = concat_gt_mat(gt_mat[var_idx], mis_as_ref, alt_sum_arr_raw)
         if mis_as_ref:
@@ -254,11 +268,12 @@ def concat_variants(var_lst: list[pysam.VariantRecord],
         gt_mat[np.ix_(var_idx, reset_hap_idx)] = 0
         # in-place update VariantRecord
         for i in var_idx:
-            update_gt_at(var_lst[i], reset_hap_idx.tolist(), hap_indexer, 
+            update_gt_at(var_lst[i], reset_hap_idx.tolist(), hap_indexer,
                          [0] * reset_hap_idx.shape[0])
 
-        # create new variant
-        new_var = create_concat_var([var_lst[i] for i in var_idx], new_gt.tolist(),
+        # create new variant (concat_alleles already succeeded, so this only
+        # returns None if alleles cancel out, which is correct)
+        new_var = create_concat_var(concat_var_lst, new_gt.tolist(),
                                     concat_n, track)
         if new_var is not None:
             ret_var_lst.append(new_var)
@@ -325,7 +340,10 @@ def create_concat_var(var_lst: list[pysam.VariantRecord], gt_lst: list[int],
                       var_id_no: int, track: str) -> pysam.VariantRecord | None:
     """ Concatenate a list of variants to create a new one """
 
-    concat_ref, concat_alt = concat_alleles(var_lst)
+    result = concat_alleles(var_lst)
+    if result is None:
+        return None
+    concat_ref, concat_alt = result
     # no variants after merging alleles
     if concat_ref == concat_alt:
         return None
@@ -347,8 +365,8 @@ def create_concat_var(var_lst: list[pysam.VariantRecord], gt_lst: list[int],
     return new_var
 
 
-def concat_alleles(var_lst: list[pysam.VariantRecord]) -> tuple[str, str]:
-    """ Concatenate alleles """
+def concat_alleles(var_lst: list[pysam.VariantRecord]) -> tuple[str, str] | None:
+    """ Concatenate alleles. Returns None if concatenation produces incompatible REF. """
 
     assert len(var_lst) > 1    # TEST ONLY, should always be true
 
@@ -360,12 +378,18 @@ def concat_alleles(var_lst: list[pysam.VariantRecord]) -> tuple[str, str]:
     # if len(ref) > 1 and len(alt) > 1:
     #     print(f'Found complex base variant at {var_lst[0].chrom}:{var_lst[0].pos}')
 
+    seen_alleles = {var_lst[0].alleles}
     for i in range(1, len(var_lst)):
         add_ref, add_alt = var_lst[i].alleles  # type: ignore
+        # skip duplicate alleles from different snarls: they should be merged, not concatenated
+        if (add_ref, add_alt) in seen_alleles:
+            continue
+        seen_alleles.add((add_ref, add_alt))
         # process indels
         if is_indel(add_ref, add_alt):
             add_indel = get_indel_seq(add_ref, add_alt)
-            check_indel(ref_trim, add_indel, var_lst[i])
+            if not check_indel(ref_trim, add_indel, var_lst[i]):
+                return None
 
             # deletion
             if len(add_ref) > 1:
@@ -399,9 +423,9 @@ def check_replacement(ref: str, alt: str, var_add: pysam.VariantRecord) -> None:
                        f"{var_add.chrom}:{var_add.pos}:{var_add.ref}_{var_add.alts[0]}") # type: ignore
 
 
-def check_indel(ref_trim: str, indel_seq: str, var_add: pysam.VariantRecord, ) -> None:
-    """ Check if a variant can be correctly concatenated with an INDEL """
-    
+def check_indel(ref_trim: str, indel_seq: str, var_add: pysam.VariantRecord, ) -> bool:
+    """ Check if a variant can be correctly concatenated with an INDEL. Returns False if incompatible. """
+
     # check if the second can be right-shifted to the end of base's ref
     indel_len = len(indel_seq)
     ref_trim_len = len(ref_trim)
@@ -417,8 +441,11 @@ def check_indel(ref_trim: str, indel_seq: str, var_add: pysam.VariantRecord, ) -
             expect_ref_trim = indel_seq * n_copy + indel_seq[:n_shift]
 
     if expect_ref_trim != ref_trim:
-        raise ValueError(f"Cannot right shift {var_add.chrom}:{var_add.pos}:{var_add.ref}_{var_add.alts[0]} " +  # type: ignore
-                         f"to the 3' end of ref allele {ref_trim}.")
+        logger.warning(f"Cannot right shift {var_add.chrom}:{var_add.pos}:{var_add.ref}_{var_add.alts[0]} " +  # type: ignore
+                       f"to the 3' end of ref allele {ref_trim}. Skipping concatenation for this variant.")
+        return False
+
+    return True
 
 
 def right_shift_indel(seq: str, n: int) -> str:
@@ -429,7 +456,7 @@ def right_shift_indel(seq: str, n: int) -> str:
 
 
 def right_trim_alleles(alleles: tuple[str, str]) -> tuple:
-    """ Left-trim same bases """
+    """ Right-trim same bases """
 
     ref_trim = alleles[0]
     alt_trim = alleles[1]
@@ -487,6 +514,12 @@ def is_indel(ref: str, alt: str) -> bool:
 
     return (len(ref) != 1) != (len(alt) != 1)
     
+
+def is_ref_compatible(ref_a: str, ref_b: str) -> bool:
+    """ Check if two REFs are compatible (one must be a prefix of the other). """
+    shorter, longer = (ref_a, ref_b) if len(ref_a) <= len(ref_b) else (ref_b, ref_a)
+    return longer.startswith(shorter)
+
 
 ## end of concat functions
 
@@ -682,12 +715,20 @@ def main() -> None:
         header = add_header(invcf.header)
     outvcf = pysam.VariantFile(args.outvcf, 'w', header=header)
     counter = VariantCounter()
-    hap_indexer = HapIndexer(next(invcf.fetch()))
+
+    first_var = next(invcf.fetch(), None)
+    if first_var is None:
+        logger.info('No variants found in input VCF')
+        invcf.close()
+        outvcf.close()
+        return
+    hap_indexer = HapIndexer(first_var)
 
     logger.info(f'Merge duplicated variants from: {args.invcf}')
     if args.concat == "none":
         logger.info("Skip variant concatenation")
-    logger.info(f'Concatenate variants with same {args.concat}')
+    else:
+        logger.info(f'Concatenate variants with same {args.concat}')
 
     # to check duplicates, we always write variants after reading its next one
     # if cur_var.pos = prev_var.pos, save them to working_var
