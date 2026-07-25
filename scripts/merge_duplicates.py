@@ -124,12 +124,15 @@ class DuplicatesDict:
                 if len(concat_var_idx) < 2:
                     continue
                 # here, we pass a copy of gt_mat, so we need to update the gt_mat
+                # every motif group lands at the same position, so each call has to know about the
+                # variants the previous ones already emitted there
                 tmp_vars, tmp_gt_mat, update_gt_mat = concat_variants([self.var_lst[i] for i in concat_var_idx],
                                                                       gt_mat[concat_var_idx],
                                                                       hap_indexer,
                                                                       mis_as_ref,
                                                                       track,
-                                                                      concat_id_start=concat_n)
+                                                                      concat_id_start=concat_n,
+                                                                      prior_vars=new_vars)
                 gt_mat[concat_var_idx] = update_gt_mat
                 # concat 2 indels with complementary REF and ALT result in no variant, make sure append real variant
                 if len(tmp_vars) > 0:
@@ -210,10 +213,15 @@ def concat_variants(var_lst: list[pysam.VariantRecord],
                     hap_indexer: HapIndexer,
                     mis_as_ref: bool, 
                     track: str,
-                    concat_id_start: int = 0) -> tuple[list[pysam.VariantRecord], np.ndarray, np.ndarray]:
+                    concat_id_start: int = 0,
+                    prior_vars: list[pysam.VariantRecord] | None = None) -> tuple[list[pysam.VariantRecord], np.ndarray, np.ndarray]:
     """
     Concatenate selected variants and update genotypes
     Genotypes in var_lst are updated in-place
+
+    prior_vars are concatenated variants already emitted at this position by an earlier call
+    (only "repeat" mode makes more than one call per position). A concatenated REF must be
+    compatible with those too, not just with var_lst.
 
     Return: 
         1. list of new variant
@@ -221,6 +229,9 @@ def concat_variants(var_lst: list[pysam.VariantRecord],
         3. genotype matrix of updated input variants
     """
     
+    if prior_vars is None:
+        prior_vars = []
+
     # gt_mat: n_var x n_hap
     alt_mat = gt_mat == 1
 
@@ -250,9 +261,14 @@ def concat_variants(var_lst: list[pysam.VariantRecord],
             alt_sum_arr[hap_idx] = 0
             continue
 
-        # validate concatenated REF against ALL variants at this position
+        # validate concatenated REF against every other record that will share this position:
+        # the inputs, and the concatenated variants already accepted here. a concatenated REF is
+        # synthesised by joining indel sequences rather than read from the reference, so two
+        # concatenations of different haplotypes can each agree with all the inputs and still
+        # disagree with one another -- which downstream `bcftools norm -m +any` rejects outright
+        # with "The REF prefixes differ", taking the whole pipe down with it
         concat_ref = concat_result[0]
-        if not all(is_ref_compatible(concat_ref, v.ref) for v in var_lst):
+        if not all(is_ref_compatible(concat_ref, v.ref) for v in var_lst + prior_vars + ret_var_lst):
             alt_sum_arr[hap_idx] = 0
             continue
 

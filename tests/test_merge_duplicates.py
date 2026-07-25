@@ -102,3 +102,47 @@ def test_error(error_type: str) -> None:
     assert expected_error in excinfo.value.stderr
 
     os.remove(outvcf)
+
+# A concatenated REF is synthesised by joining indel sequences, not read from the reference, so
+# two concatenations at one position can each agree with every input record and still disagree
+# with one another. `bcftools norm -m +any` rejects such a pair outright ("The REF prefixes
+# differ") and takes the surrounding pipe down with it, so we must never emit one.
+@pytest.mark.order(4)
+def test_concat_refs_mutually_compatible(tmp_path) -> None:
+
+    # the reference starts ACTCTC..., so every REF below is a genuine prefix of it, exactly as
+    # `bcftools norm -f` would leave them. sample1 carries v1+v2, which concatenates to ACTCTCT;
+    # sample2 carries v1+v3, which concatenates to ACTCTCCT. Each is compatible with all three
+    # inputs, but they diverge from each other at offset 6.
+    records = [('ACT', '1', '1'), ('ACTCT', '1', '0'), ('ACTCTC', '0', '1')]
+    header = ['##fileformat=VCFv4.2',
+              '##contig=<ID=c,length=1000>',
+              '##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count">',
+              '##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency">',
+              '##INFO=<ID=AN,Number=1,Type=Integer,Description="Allele number">',
+              '##INFO=<ID=NS,Number=1,Type=Integer,Description="Number of samples">',
+              '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+              '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample1\tsample2']
+
+    invcf = tmp_path / 'ref_conflict.input.vcf'
+    outvcf = tmp_path / 'ref_conflict.output.vcf.gz'
+    with open(invcf, 'w') as in_file:
+        in_file.write('\n'.join(header) + '\n')
+        for i, (ref, gt1, gt2) in enumerate(records, 1):
+            in_file.write('c\t10\tv{}\t{}\tA\t60\t.\tAC={};AF=0.5;AN=2;NS=2\tGT\t{}\t{}\n'.format(
+                i, ref, int(gt1) + int(gt2), gt1, gt2))
+
+    subprocess.run([SCRIPT, '-i', str(invcf), '-o', str(outvcf)], check=True)
+
+    refs_by_pos = {}
+    output_vcf = pysam.VariantFile(str(outvcf))
+    for record in output_vcf:
+        refs_by_pos.setdefault((record.chrom, record.pos), []).append(record.ref)
+    output_vcf.close()
+
+    for (chrom, pos), refs in refs_by_pos.items():
+        for i, ref_a in enumerate(refs):
+            for ref_b in refs[i + 1:]:
+                shorter, longer = sorted((ref_a, ref_b), key=len)
+                assert longer.startswith(shorter), \
+                    f"incompatible REFs at {chrom}:{pos}: {ref_a} vs {ref_b}"
