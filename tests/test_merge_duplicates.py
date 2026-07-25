@@ -12,7 +12,7 @@ INPUT_DIR = os.path.join(TEST_DIR, 'merge_duplicates', 'input')
 TRUTH_DIR = os.path.join(TEST_DIR, 'merge_duplicates', 'truth')
 OUTPUT_DIR = os.path.join(TEST_DIR, 'merge_duplicates', 'output')
 TYPE = ['position', 'mis_as_ref', 'repeat', 'none', 'warning']
-ERROR_TYPE = ['right_shift_error']
+SHIFT_CONFLICT_TYPE = ['right_shift_error']
 
 # Run command
 def run_script(vcf_type: str) -> None:
@@ -83,23 +83,38 @@ def test_output(vcf_type: str) -> None:
 
     os.remove(file_output_vcf)
 
-# Catch error
+# An indel that cannot be right shifted to the 3' end of the base REF is a conflict, not a fatal
+# error: concatenating it would invent a REF that disagrees with the reference genome. The script
+# must warn, skip only that concatenation, and pass the conflicting records through untouched --
+# dropping the alleles it could not combine would silently shorten the haplotype.
 @pytest.mark.order(3)
-@pytest.mark.parametrize("error_type", ERROR_TYPE)
-def test_error(error_type: str) -> None:
-    
-    invcf = os.path.join(INPUT_DIR, error_type + '.input.vcf.gz')
-    outvcf = os.path.join(OUTPUT_DIR, error_type + '.output.vcf.gz')
+@pytest.mark.parametrize("conflict_type", SHIFT_CONFLICT_TYPE)
+def test_shift_conflict(conflict_type: str) -> None:
+
+    invcf = os.path.join(INPUT_DIR, conflict_type + '.input.vcf.gz')
+    outvcf = os.path.join(OUTPUT_DIR, conflict_type + '.output.vcf.gz')
+
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
     command = [SCRIPT, '-i', invcf, '-o',  outvcf]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
 
-    if error_type == 'right_shift_error':
-        expected_error = 'ValueError: Cannot right shift'
+    if conflict_type == 'right_shift_error':
+        expected_warning = 'Cannot right shift'
 
-    with pytest.raises(subprocess.CalledProcessError) as excinfo:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+    assert expected_warning in result.stderr
+    assert '0 variants are concatenated' in result.stderr
 
-    assert expected_error in excinfo.value.stderr
+    # no allele is lost: every input record survives with its alleles and genotypes intact
+    def get_records(vcf_file: str) -> set:
+        vcf = pysam.VariantFile(vcf_file, 'rb')
+        records = {(rec.id, rec.alleles, tuple(tuple(s['GT']) for s in rec.samples.values()))
+                   for rec in vcf}
+        vcf.close()
+        return records
+
+    assert get_records(outvcf) == get_records(invcf)
 
     os.remove(outvcf)
 

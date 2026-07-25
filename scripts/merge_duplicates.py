@@ -394,11 +394,16 @@ def concat_alleles(var_lst: list[pysam.VariantRecord]) -> tuple[str, str] | None
     # if len(ref) > 1 and len(alt) > 1:
     #     print(f'Found complex base variant at {var_lst[0].chrom}:{var_lst[0].pos}')
 
+    # a duplicate INSERTION is legitimate: insertions consume no reference span, so one
+    # haplotype really can carry several copies of the same inserted sequence here, and
+    # skipping them would silently shorten the reconstructed haplotype.  a duplicate
+    # DELETION is not: the same reference span cannot be deleted twice, and concatenating
+    # it fabricates reference sequence the genome does not contain.
     seen_alleles = {var_lst[0].alleles}
     for i in range(1, len(var_lst)):
         add_ref, add_alt = var_lst[i].alleles  # type: ignore
-        # skip duplicate alleles from different snarls: they should be merged, not concatenated
-        if (add_ref, add_alt) in seen_alleles:
+        is_insertion = is_indel(add_ref, add_alt) and len(add_ref) == 1
+        if (add_ref, add_alt) in seen_alleles and not is_insertion:
             continue
         seen_alleles.add((add_ref, add_alt))
         # process indels
